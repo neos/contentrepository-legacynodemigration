@@ -5,10 +5,17 @@ declare(strict_types=1);
 namespace Neos\ContentRepository\LegacyNodeMigration;
 
 use Doctrine\DBAL\Platforms\PostgreSQL100Platform;
+use League\Flysystem\Filesystem;
+use League\Flysystem\FilesystemException;
 use Neos\ContentRepository\DimensionSpace\DimensionSpace\DimensionSpacePointSet;
 use Neos\ContentRepository\DimensionSpace\DimensionSpace\InterDimensionalVariationGraph;
 use Neos\ContentRepository\DimensionSpace\DimensionSpace\VariantType;
+use Neos\ContentRepository\Export\Event\ValueObject\ExportedEvent;
+use Neos\ContentRepository\Export\ProcessorInterface;
+use Neos\ContentRepository\Export\ProcessorResult;
+use Neos\ContentRepository\Export\Severity;
 use Neos\ContentRepository\Feature\Common\PropertyValuesToWrite;
+use Neos\ContentRepository\Feature\Common\SerializedNodeReferences;
 use Neos\ContentRepository\Feature\NodeCreation\Event\NodeAggregateWithNodeWasCreated;
 use Neos\ContentRepository\Feature\NodeDisabling\Event\NodeAggregateWasDisabled;
 use Neos\ContentRepository\Feature\NodeModification\Event\NodePropertiesWereSet;
@@ -33,6 +40,7 @@ use Neos\ContentRepository\SharedModel\Node\NodeAggregateIdentifiers;
 use Neos\ContentRepository\SharedModel\Node\NodeName;
 use Neos\ContentRepository\SharedModel\Node\NodePath;
 use Neos\ContentRepository\SharedModel\Node\OriginDimensionSpacePoint;
+use Neos\ContentRepository\SharedModel\Node\OriginDimensionSpacePointSet;
 use Neos\ContentRepository\SharedModel\Node\PropertyName;
 use Neos\ContentRepository\SharedModel\NodeType\NodeType;
 use Neos\ContentRepository\SharedModel\NodeType\NodeTypeManager;
@@ -40,15 +48,18 @@ use Neos\ContentRepository\SharedModel\NodeType\NodeTypeName;
 use Neos\ContentRepository\SharedModel\User\UserIdentifier;
 use Neos\ContentRepository\SharedModel\Workspace\ContentStreamIdentifier;
 use Neos\EventSourcing\Event\DomainEventInterface;
+use Neos\EventSourcing\EventStore\EventNormalizer;
 use Neos\Flow\Persistence\Doctrine\DataTypes\JsonArrayType;
 use Neos\Flow\Property\PropertyMapper;
+use Ramsey\Uuid\Uuid;
+use Webmozart\Assert\Assert;
 
-final class NodeDataToEventsMigration
+final class NodeDataToEventsProcessor implements ProcessorInterface
 {
 
+    private array $callbacks = [];
     private NodeTypeName $sitesNodeTypeName;
     private ContentStreamIdentifier $contentStreamIdentifier;
-
     private VisitedNodeAggregates $visitedNodes;
 
     /**
@@ -56,11 +67,21 @@ final class NodeDataToEventsMigration
      */
     private array $nodeReferencesWereSetEvents = [];
 
+    private int $numberOfExportedEvents = 0;
+
+    /**
+     * @var resource|null
+     */
+    private $eventFileResource;
+
     public function __construct(
         private readonly NodeTypeManager $nodeTypeManager,
         private readonly PropertyMapper $propertyMapper,
         private readonly PropertyConverter $propertyConverter,
         private readonly InterDimensionalVariationGraph $interDimensionalVariationGraph,
+        private readonly EventNormalizer $eventNormalizer,
+        private readonly Filesystem $files,
+        private readonly iterable $nodeDataRows,
     ) {
         $this->sitesNodeTypeName = NodeTypeName::fromString('Neos.Neos:Sites');
         $this->contentStreamIdentifier = ContentStreamIdentifier::create();
@@ -77,25 +98,39 @@ final class NodeDataToEventsMigration
         $this->sitesNodeTypeName = $nodeTypeName;
     }
 
-    /**
-     * @param iterable<array> $nodeDataRows
-     * @return iterable<DomainEventInterface>
-     */
-    public function run(iterable $nodeDataRows): iterable
+    public function onMessage(\Closure $callback): void
+    {
+        $this->callbacks[] = $callback;
+    }
+
+    public function run(): ProcessorResult
     {
         $this->resetRuntimeState();
 
-        foreach ($nodeDataRows as $nodeDataRow) {
+        foreach ($this->nodeDataRows as $nodeDataRow) {
             if ($nodeDataRow['path'] === '/sites') {
                 $sitesNodeAggregateIdentifier = NodeAggregateIdentifier::fromString($nodeDataRow['identifier']);
                 $this->visitedNodes->addRootNode($sitesNodeAggregateIdentifier, $this->sitesNodeTypeName, NodePath::fromString('/sites'), $this->interDimensionalVariationGraph->getDimensionSpacePoints());
-                yield new RootNodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $sitesNodeAggregateIdentifier, $this->sitesNodeTypeName, $this->interDimensionalVariationGraph->getDimensionSpacePoints(), NodeAggregateClassification::CLASSIFICATION_ROOT, UserIdentifier::forSystemUser());
+                $this->exportEvent(new RootNodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $sitesNodeAggregateIdentifier, $this->sitesNodeTypeName, $this->interDimensionalVariationGraph->getDimensionSpacePoints(), NodeAggregateClassification::CLASSIFICATION_ROOT, UserIdentifier::forSystemUser()));
                 continue;
             }
-            yield from $this->processNodeData($nodeDataRow);
+            try {
+                $this->processNodeData($nodeDataRow);
+            } catch (MigrationException $exception) {
+                return ProcessorResult::error($exception->getMessage());
+            }
         }
         // Set References, now when the full import is done.
-        yield from $this->nodeReferencesWereSetEvents;
+        foreach ($this->nodeReferencesWereSetEvents as $nodeReferencesWereSetEvent) {
+            $this->exportEvent($nodeReferencesWereSetEvent);
+        }
+
+        try {
+            $this->files->writeStream('events.jsonl', $this->eventFileResource);
+        } catch (FilesystemException $exception) {
+            return ProcessorResult::error(sprintf('Failed to write events.jsonl: %s', $exception->getMessage()));
+        }
+        return ProcessorResult::success(sprintf('Exported %d event%s', $this->numberOfExportedEvents, $this->numberOfExportedEvents === 1 ? '' : 's'));
     }
 
     /** ----------------------------- */
@@ -104,14 +139,27 @@ final class NodeDataToEventsMigration
     {
         $this->visitedNodes = new VisitedNodeAggregates();
         $this->nodeReferencesWereSetEvents = [];
-        $this->nodeDatasToExportAtNextIteration = [];
+        $this->numberOfExportedEvents = 0;
+        $this->eventFileResource = fopen('php://temp/maxmemory:5242880', 'rb+');
+        Assert::resource($this->eventFileResource, null, 'Failed to create temporary event file resource');
+    }
+
+    private function exportEvent(DomainEventInterface $event): void
+    {
+        $exportedEvent = new ExportedEvent(
+            Uuid::uuid4()->toString(),
+            $this->eventNormalizer->getEventType($event),
+            $this->eventNormalizer->normalize($event),
+            []
+        );
+        fwrite($this->eventFileResource, $exportedEvent->toJson() . chr(10));
+        $this->numberOfExportedEvents ++;
     }
 
     /**
      * @param array $nodeDataRow
-     * @return \Traversable<DomainEventInterface>
      */
-    private function processNodeData(array $nodeDataRow): \Traversable
+    private function processNodeData(array $nodeDataRow): void
     {
         $nodeAggregateIdentifier = NodeAggregateIdentifier::fromString($nodeDataRow['identifier']);
         $nodePath = NodePath::fromString(strtolower($nodeDataRow['path']));
@@ -137,20 +185,20 @@ final class NodeDataToEventsMigration
         if ($this->isAutoCreatedChildNode($parentNodeAggregate->nodeTypeName, $nodeName)) {
             // Create tethered node
             $specializations = $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint(), true, $this->visitedNodes->alreadyVisitedOriginDimensionSpacePoints($nodeAggregateIdentifier)->toDimensionSpacePointSet());
-            yield new NodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $nodeAggregateIdentifier, $nodeTypeName, $originDimensionSpacePoint, $specializations, $parentNodeAggregate->nodeAggregateIdentifier, $nodeName, $serializedPropertyValuesAndReferences->serializedPropertyValues, NodeAggregateClassification::CLASSIFICATION_TETHERED, UserIdentifier::forSystemUser(), null);
+            $this->exportEvent(new NodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $nodeAggregateIdentifier, $nodeTypeName, $originDimensionSpacePoint, $specializations, $parentNodeAggregate->nodeAggregateIdentifier, $nodeName, $serializedPropertyValuesAndReferences->serializedPropertyValues, NodeAggregateClassification::CLASSIFICATION_TETHERED, UserIdentifier::forSystemUser(), null));
         } elseif ($this->visitedNodes->containsNodeAggregate($nodeAggregateIdentifier)) {
             // Create node variant
-            yield from $this->createNodeVariant($nodeAggregateIdentifier, $originDimensionSpacePoint, $serializedPropertyValuesAndReferences, $parentNodeAggregate);
+            $this->createNodeVariant($nodeAggregateIdentifier, $originDimensionSpacePoint, $serializedPropertyValuesAndReferences, $parentNodeAggregate);
         } else {
             // create node aggregate
-            yield new NodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $nodeAggregateIdentifier, $nodeTypeName, $originDimensionSpacePoint, $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint()), $parentNodeAggregate->nodeAggregateIdentifier, $nodeName, $serializedPropertyValuesAndReferences->serializedPropertyValues, NodeAggregateClassification::CLASSIFICATION_REGULAR, UserIdentifier::forSystemUser(), null);
+            $this->exportEvent( new NodeAggregateWithNodeWasCreated($this->contentStreamIdentifier, $nodeAggregateIdentifier, $nodeTypeName, $originDimensionSpacePoint, $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint()), $parentNodeAggregate->nodeAggregateIdentifier, $nodeName, $serializedPropertyValuesAndReferences->serializedPropertyValues, NodeAggregateClassification::CLASSIFICATION_REGULAR, UserIdentifier::forSystemUser(), null));
         }
         // nodes are hidden via NodeAggregateWasDisabled event
         if ($nodeDataRow['hidden']) {
-            yield new NodeAggregateWasDisabled($this->contentStreamIdentifier, $nodeAggregateIdentifier, $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint(), true, $this->visitedNodes->alreadyVisitedOriginDimensionSpacePoints($nodeAggregateIdentifier)->toDimensionSpacePointSet()), UserIdentifier::forSystemUser());
+            $this->exportEvent( new NodeAggregateWasDisabled($this->contentStreamIdentifier, $nodeAggregateIdentifier, $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint(), true, $this->visitedNodes->alreadyVisitedOriginDimensionSpacePoints($nodeAggregateIdentifier)->toDimensionSpacePointSet()), UserIdentifier::forSystemUser()));
         }
         foreach ($serializedPropertyValuesAndReferences->references as $referencePropertyName => $destinationNodeAggregateIdentifiers) {
-            $this->nodeReferencesWereSetEvents[] = new NodeReferencesWereSet($this->contentStreamIdentifier, $nodeAggregateIdentifier, $originDimensionSpacePoint, $destinationNodeAggregateIdentifiers, PropertyName::fromString($referencePropertyName), UserIdentifier::forSystemUser());
+            $this->nodeReferencesWereSetEvents[] = new NodeReferencesWereSet($this->contentStreamIdentifier, $nodeAggregateIdentifier, new OriginDimensionSpacePointSet([$originDimensionSpacePoint]), PropertyName::fromString($referencePropertyName), SerializedNodeReferences::fromNodeAggregateIdentifiers($destinationNodeAggregateIdentifiers), UserIdentifier::forSystemUser());
         }
 
         $this->visitedNodes->add($nodeAggregateIdentifier, new DimensionSpacePointSet([$originDimensionSpacePoint->toDimensionSpacePoint()]), $nodeTypeName, $nodePath, $parentNodeAggregate->nodeAggregateIdentifier);
@@ -204,7 +252,7 @@ final class NodeDataToEventsMigration
      * NOTE: We prioritize specializations/generalizations over peer variants ("ch" creates a specialization variant of "de" rather than a peer of "en" if both has been seen before).
      * For that reason we loop over all previously visited dimension space points until we encounter a specialization/generalization. Otherwise, the last NodePeerVariantWasCreated will be used
      */
-    private function createNodeVariant(NodeAggregateIdentifier $nodeAggregateIdentifier, OriginDimensionSpacePoint $originDimensionSpacePoint, SerializedPropertyValuesAndReferences $serializedPropertyValuesAndReferences, VisitedNodeAggregate $parentNodeAggregate): \Traversable
+    private function createNodeVariant(NodeAggregateIdentifier $nodeAggregateIdentifier, OriginDimensionSpacePoint $originDimensionSpacePoint, SerializedPropertyValuesAndReferences $serializedPropertyValuesAndReferences, VisitedNodeAggregate $parentNodeAggregate): void
     {
         $alreadyVisitedOriginDimensionSpacePoints = $this->visitedNodes->alreadyVisitedOriginDimensionSpacePoints($nodeAggregateIdentifier);
         $coveredDimensionSpacePoints = $this->interDimensionalVariationGraph->getSpecializationSet($originDimensionSpacePoint->toDimensionSpacePoint(), true, $alreadyVisitedOriginDimensionSpacePoints->toDimensionSpacePointSet());
@@ -226,15 +274,15 @@ final class NodeDataToEventsMigration
         if ($variantCreatedEvent === null) {
             throw new MigrationException(sprintf('Node "%s" for dimension %s was already created previously', $nodeAggregateIdentifier, $originDimensionSpacePoint), 1656057201);
         }
-        yield $variantCreatedEvent;
+        $this->exportEvent($variantCreatedEvent);
         if ($serializedPropertyValuesAndReferences->serializedPropertyValues->count() > 0) {
-            yield new NodePropertiesWereSet($this->contentStreamIdentifier, $nodeAggregateIdentifier, $originDimensionSpacePoint, $serializedPropertyValuesAndReferences->serializedPropertyValues, UserIdentifier::forSystemUser());
+            $this->exportEvent(new NodePropertiesWereSet($this->contentStreamIdentifier, $nodeAggregateIdentifier, $originDimensionSpacePoint, $serializedPropertyValuesAndReferences->serializedPropertyValues, UserIdentifier::forSystemUser()));
         }
         // When we specialize/generalize, we create a node variant at exactly the same tree location as the source node
         // If the parent node aggregate id differs, we need to move the just created variant to the new location
         $nodeAggregate = $this->visitedNodes->getByNodeAggregateIdentifier($nodeAggregateIdentifier);
         if (!$parentNodeAggregate->nodeAggregateIdentifier->equals($nodeAggregate->getVariant($variantSourceOriginDimensionSpacePoint)->parentNodeAggregateIdentifier)) {
-            yield new NodeAggregateWasMoved(
+            $this->exportEvent(new NodeAggregateWasMoved(
                 $this->contentStreamIdentifier,
                 $nodeAggregateIdentifier,
                 NodeMoveMappings::fromArray([
@@ -246,7 +294,7 @@ final class NodeDataToEventsMigration
                 ]),
                 new DimensionSpacePointSet([]),
                 UserIdentifier::forSystemUser()
-            );
+            ));
         }
     }
 
@@ -261,5 +309,11 @@ final class NodeDataToEventsMigration
         return $nodeTypeOfParent->hasAutoCreatedChildNode($nodeName);
     }
 
-
+    private function dispatch(Severity $severity, string $message, mixed ...$args): void
+    {
+        $renderedMessage = sprintf($message, ...$args);
+        foreach ($this->callbacks as $callback) {
+            $callback($severity, $renderedMessage);
+        }
+    }
 }
